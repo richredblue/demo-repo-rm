@@ -1,0 +1,21 @@
+//
+//  WorkoutMetrics.swift
+//  Lightbulb
+//
+//  Created by Richard Melik on 16/12/2025.
+//
+
+import Foundation
+import Combine
+
+class WorkoutMetrics: ObservableObject {
+    @Published var elapsedTime: TimeInterval = 0
+    
+    @Published var powerInstant: Int? = nil
+    @Published var power3s: Int? = nil
+    
+    @Published var cadence: Int? = nil
+    @Published var heartRate: Int? = nil
+}
+
+
