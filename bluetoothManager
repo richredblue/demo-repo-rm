@@ -1,0 +1,200 @@
+//
+//  BluetoothManager.swift
+//  Lightbulb
+//
+//  Created by Richard Melik on 16/12/2025.
+//
+
+import Foundation
+import CoreBluetooth
+import Combine
+
+class BluetoothManager: NSObject, ObservableObject {
+    private var central: CBCentralManager!
+    
+    @Published var discoveredPeripherals: [CBPeripheral] = []
+    
+    // Keep references so they don't deallocate
+    private var heartRatePeripheral: CBPeripheral?
+    private var cadencePeripheral: CBPeripheral?
+    private var trainerPeripheral: CBPeripheral?
+    
+    private var metrics: WorkoutMetrics
+    private var powerSamples: [(time: TimeInterval, watts: Int)] = []
+    private var startTime: Date?
+    
+    // Common GATT services
+    private let heartRateServiceUUID = CBUUID(string: "180D")
+    private let cscServiceUUID = CBUUID(string: "1816")
+    private let cyclingPowerServiceUUID = CBUUID(string: "1818") // optional depending on trainer
+    
+    init(metrics: WorkoutMetrics) {
+        self.metrics = metrics
+        super.init()
+        central = CBCentralManager(delegate: self, queue: .main)
+    }
+    
+    func startScanning() {
+        // nil services == any, but you can restrict to HR/CSC/Power services
+        let services = [heartRateServiceUUID, cscServiceUUID, cyclingPowerServiceUUID]
+        central.scanForPeripherals(withServices: services, options: nil)
+    }
+    
+    func stopScanning() {
+        central.stopScan()
+    }
+    
+    func connect(_ peripheral: CBPeripheral) {
+        central.connect(peripheral, options: nil)
+    }
+    
+    func startWorkoutTimer() {
+        startTime = Date()
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self = self, let start = self.startTime else {
+                timer.invalidate()
+                return
+            }
+            self.metrics.elapsedTime = Date().timeIntervalSince(start)
+        }
+    }
+}
+
+// MARK: - CBCentralManagerDelegate
+
+extension BluetoothManager: CBCentralManagerDelegate {
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard central.state == .poweredOn else { return }
+        startScanning()
+    }
+    
+    func centralManager(_ central: CBCentralManager,
+                        didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String : Any],
+                        rssi RSSI: NSNumber) {
+        if !discoveredPeripherals.contains(where: { $0.identifier == peripheral.identifier }) {
+            discoveredPeripherals.append(peripheral)
+        }
+    }
+    
+    func centralManager(_ central: CBCentralManager,
+                        didConnect peripheral: CBPeripheral) {
+        peripheral.delegate = self
+        peripheral.discoverServices(nil)
+    }
+}
+
+// MARK: - CBPeripheralDelegate
+
+extension BluetoothManager: CBPeripheralDelegate {
+    func peripheral(_ peripheral: CBPeripheral,
+                    didDiscoverServices error: Error?) {
+        guard error == nil else { return }
+        peripheral.services?.forEach { service in
+            peripheral.discoverCharacteristics(nil, for: service)
+        }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral,
+                    didDiscoverCharacteristicsFor service: CBService,
+                    error: Error?) {
+        guard error == nil else { return }
+        
+        service.characteristics?.forEach { characteristic in
+            // Subscribe to notify where available
+            if characteristic.properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+        }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral,
+                    didUpdateValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard error == nil, let value = characteristic.value else { return }
+        
+        let serviceUUID = characteristic.service?.uuid
+        
+        // Heart rate
+        if serviceUUID == heartRateServiceUUID {
+            handleHeartRate(value)
+        }
+        // Cadence (CSC)
+        else if serviceUUID == cscServiceUUID {
+            handleCadence(value)
+        }
+        // Power (Cycling Power service – may differ per trainer)
+        else if serviceUUID == cyclingPowerServiceUUID {
+            handlePower(value)
+        }
+    }
+}
+
+// MARK: - Parsing helpers
+
+extension BluetoothManager {
+    private func handleHeartRate(_ data: Data) {
+        // Very simplified HR parsing per Bluetooth spec:
+        // [flags (1 byte)] [HR value (1 or 2 bytes)]
+        guard data.count >= 2 else { return }
+        let flags = data[0]
+        let hrIsUInt16 = (flags & 0x01) != 0
+        
+        let hr: Int
+        if hrIsUInt16 {
+            guard data.count >= 3 else { return }
+            hr = Int(UInt16(data[1]) | (UInt16(data[2]) << 8))
+        } else {
+            hr = Int(data[1])
+        }
+        
+        DispatchQueue.main.async {
+            self.metrics.heartRate = hr
+        }
+    }
+    
+    private func handleCadence(_ data: Data) {
+        // CSC Measurement format is more complex (includes wheel revs, crank revs, timestamps).
+        // For simplicity, imagine we’ve already extracted cadence (rpm) from the bytes:
+        let cadenceRPM = parseCadenceFromCSC(data: data)
+        
+        DispatchQueue.main.async {
+            self.metrics.cadence = cadenceRPM
+        }
+    }
+    
+    private func parseCadenceFromCSC(data: Data) -> Int {
+        // TODO: implement according to Bluetooth CSC spec
+        // Placeholder:
+        return 90
+    }
+    
+    private func handlePower(_ data: Data) {
+        // Cycling Power Measurement:
+        // Flags (2 bytes) + Instantaneous Power (2 bytes, signed)
+        guard data.count >= 4 else { return }
+        let bytes = [UInt8](data)
+        let power = Int16(bitPattern: UInt16(bytes[2]) | (UInt16(bytes[3]) << 8))
+        let watts = Int(power)
+        
+        DispatchQueue.main.async {
+            self.metrics.powerInstant = watts
+            self.update3SecondPower(with: watts)
+        }
+    }
+    
+    private func update3SecondPower(with watts: Int) {
+        let now = Date().timeIntervalSince1970
+        powerSamples.append((time: now, watts: watts))
+        
+        // Drop samples older than 3 seconds
+        powerSamples = powerSamples.filter { now - $0.time <= 3.0 }
+        
+        let sum = powerSamples.reduce(0) { $0 + $1.watts }
+        if !powerSamples.isEmpty {
+            metrics.power3s = sum / powerSamples.count
+        } else {
+            metrics.power3s = nil
+        }
+    }
+}
