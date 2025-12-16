@@ -1,0 +1,59 @@
+//
+//  PairingView.swift
+//  Lightbulb
+//
+//  Created by Richard Melik on 16/12/2025.
+//
+
+import SwiftUI
+import CoreBluetooth
+
+struct PairingView: View {
+    @StateObject var metrics = WorkoutMetrics()
+    @StateObject var btManager: BluetoothManager
+    
+    init() {
+        let metrics = WorkoutMetrics()
+        _metrics = StateObject(wrappedValue: metrics)
+        _btManager = StateObject(wrappedValue: BluetoothManager(metrics: metrics))
+    }
+    
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Discovered Devices") {
+                    ForEach(btManager.discoveredPeripherals, id: \.identifier) { peripheral in
+                        Button {
+                            btManager.connect(peripheral)
+                        } label: {
+                            HStack {
+                                Text(peripheral.name ?? "Unknown")
+                                Spacer()
+                                Text(peripheral.identifier.uuidString.prefix(4) + "…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Pair Devices")
+            .toolbar {
+                NavigationLink("Start Workout") {
+                    WorkoutView(metrics: metrics)
+                        .onAppear {
+                            btManager.startWorkoutTimer()
+                        }
+                }
+            }
+            .onAppear {
+                btManager.startScanning()
+            }
+        }
+    }
+}
+
+
+#Preview {
+    PairingView()
+}
