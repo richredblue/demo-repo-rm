@@ -1,0 +1,85 @@
+//
+//  WorkoutView.swift
+//  Lightbulb
+//
+//  Created by Richard Melik on 16/12/2025.
+//
+
+import SwiftUI
+
+struct WorkoutView: View {
+    @ObservedObject var metrics: WorkoutMetrics
+    
+    var body: some View {
+        VStack(spacing: 24) {
+            Text("Workout")
+                .font(.largeTitle)
+                .bold()
+            
+            // 3-second power
+            VStack {
+                Text("3s Power")
+                    .font(.headline)
+                Text(metrics.power3s.map { "\($0) W" } ?? "-- W")
+                    .font(.system(size: 48, weight: .bold, design: .rounded))
+            }
+            
+            HStack(spacing: 32) {
+                MetricTile(title: "Cadence",
+                           value: metrics.cadence.map { "\($0) rpm" } ?? "-- rpm")
+                MetricTile(title: "Heart Rate",
+                           value: metrics.heartRate.map { "\($0) bpm" } ?? "-- bpm")
+            }
+            
+            VStack {
+                Text("Elapsed Time")
+                    .font(.headline)
+                Text(formatTime(metrics.elapsedTime))
+                    .font(.title)
+                    .monospacedDigit()
+            }
+            
+            Spacer()
+        }
+        .padding()
+    }
+    
+    private func formatTime(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds)
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        
+        if h > 0 {
+            return String(format: "%02d:%02d:%02d", h, m, sec)
+        } else {
+            return String(format: "%02d:%02d", m, sec)
+        }
+    }
+}
+
+struct MetricTile: View {
+    let title: String
+    let value: String
+    
+    var body: some View {
+        VStack {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title2)
+                .bold()
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
+        .background(.thinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+
+#Preview("Workout Screen") {
+    WorkoutView(metrics: WorkoutMetrics())
+}
+
