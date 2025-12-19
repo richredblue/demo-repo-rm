@@ -1,62 +1,144 @@
 //
 //  BluetoothManager.swift
-//  Lightbulb
+//  Freespeed
 //
-//  Created by Richard Melik on 16/12/2025.
+//  Created by Richard Melik on 19/12/2025.
 //
 
 import Foundation
 import CoreBluetooth
 import Combine
 
+enum BluetoothStateDisplay: String {
+    case unknown = "Unknown"
+    case resetting = "Resetting"
+    case unsupported = "Unsupported"
+    case unauthorized = "Unauthorized"
+    case poweredOff = "Powered Off"
+    case poweredOn = "Powered On"
+}
+
+enum DeviceCategory: String, Codable {
+    case trainer = "Trainer"
+    case powerMeter = "Power Meter"
+    case heartRate = "Heart Rate"
+    case cadence = "Cadence"
+}
+
+struct DiscoveredDevice: Identifiable, Equatable, Hashable {
+    let peripheral: CBPeripheral
+    let category: DeviceCategory
+    var customName: String?
+    var isConnected: Bool = false
+    
+    var id: UUID { peripheral.identifier }
+    
+    var defaultName: String {
+        peripheral.name ?? "Unknown device"
+    }
+    
+    var displayName: String {
+        customName ?? defaultName
+    }
+    
+    static func == (lhs: DiscoveredDevice, rhs: DiscoveredDevice) -> Bool {
+        lhs.id == rhs.id
+    }
+    
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
 class BluetoothManager: NSObject, ObservableObject {
+    @Published var state: BluetoothStateDisplay = .unknown
+    @Published var devices: [DiscoveredDevice] = []
+    
     private var central: CBCentralManager!
+    private let metrics: WorkoutMetrics
     
-    @Published var discoveredPeripherals: [CBPeripheral] = []
-    
-    // Keep references so they don't deallocate
-    private var heartRatePeripheral: CBPeripheral?
-    private var cadencePeripheral: CBPeripheral?
-    private var trainerPeripheral: CBPeripheral?
-    
-    private var metrics: WorkoutMetrics
-    private var powerSamples: [(time: TimeInterval, watts: Int)] = []
-    private var startTime: Date?
-    
-    // Common GATT services
+    // Service UUIDs we care about
     private let heartRateServiceUUID = CBUUID(string: "180D")
     private let cscServiceUUID = CBUUID(string: "1816")
-    private let cyclingPowerServiceUUID = CBUUID(string: "1818") // optional depending on trainer
+    private let cyclingPowerServiceUUID = CBUUID(string: "1818")
+    private let ftmsServiceUUID = CBUUID(string: "1826")
+    
+    // Characteristic UUIDs
+    private let heartRateMeasurementUUID = CBUUID(string: "2A37")
+    private let cscMeasurementUUID = CBUUID(string: "2A5B")
+    private let cyclingPowerMeasurementUUID = CBUUID(string: "2A63")
+    private let indoorBikeDataUUID = CBUUID(string: "2AD2")  // FTMS Indoor Bike Data
+    
+    private let labelsKey = "BLEDeviceLabels"
+    private var savedLabels: [String: String] = [:]
+    
+    // For 3-second power average
+    private var powerSamples: [(time: TimeInterval, watts: Int)] = []
+    
+    // For cadence from crank data (per device) – used by CSC and (optionally) CPS
+    private var lastCrankData: [UUID: (revs: UInt16, eventTime: UInt16)] = [:]
     
     init(metrics: WorkoutMetrics) {
         self.metrics = metrics
         super.init()
+        loadLabels()
         central = CBCentralManager(delegate: self, queue: .main)
     }
     
+    // MARK: - Public API
+    
     func startScanning() {
-        // nil services == any, but you can restrict to HR/CSC/Power services
-        let services = [heartRateServiceUUID, cscServiceUUID, cyclingPowerServiceUUID]
-        central.scanForPeripherals(withServices: services, options: nil)
+        guard central.state == .poweredOn else { return }
+        
+        let services = [
+            heartRateServiceUUID,
+            cscServiceUUID,
+            cyclingPowerServiceUUID,
+            ftmsServiceUUID
+        ]
+        
+        central.scanForPeripherals(withServices: services,
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
     
     func stopScanning() {
         central.stopScan()
     }
     
-    func connect(_ peripheral: CBPeripheral) {
-        central.connect(peripheral, options: nil)
+    func connect(_ device: DiscoveredDevice) {
+        central.connect(device.peripheral, options: nil)
     }
     
-    func startWorkoutTimer() {
-        startTime = Date()
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
-            guard let self = self, let start = self.startTime else {
-                timer.invalidate()
-                return
-            }
-            self.metrics.elapsedTime = Date().timeIntervalSince(start)
+    func disconnect(_ device: DiscoveredDevice) {
+        central.cancelPeripheralConnection(device.peripheral)
+    }
+    
+    func updateCustomName(for deviceID: UUID, to newName: String?) {
+        let key = deviceID.uuidString
+        
+        if let newName, !newName.isEmpty {
+            savedLabels[key] = newName
+        } else {
+            savedLabels.removeValue(forKey: key)
         }
+        
+        UserDefaults.standard.set(savedLabels, forKey: labelsKey)
+        
+        if let index = devices.firstIndex(where: { $0.id == deviceID }) {
+            devices[index].customName = newName
+        }
+    }
+    
+    // MARK: - Persistence
+    
+    private func loadLabels() {
+        if let dict = UserDefaults.standard.dictionary(forKey: labelsKey) as? [String: String] {
+            savedLabels = dict
+        }
+    }
+    
+    private func labelFor(_ peripheral: CBPeripheral) -> String? {
+        savedLabels[peripheral.identifier.uuidString]
     }
 }
 
@@ -64,23 +146,69 @@ class BluetoothManager: NSObject, ObservableObject {
 
 extension BluetoothManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        guard central.state == .poweredOn else { return }
-        startScanning()
+        switch central.state {
+        case .unknown:
+            state = .unknown
+        case .resetting:
+            state = .resetting
+        case .unsupported:
+            state = .unsupported
+        case .unauthorized:
+            state = .unauthorized
+        case .poweredOff:
+            state = .poweredOff
+        case .poweredOn:
+            state = .poweredOn
+            startScanning()
+        @unknown default:
+            state = .unknown
+        }
     }
     
     func centralManager(_ central: CBCentralManager,
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any],
                         rssi RSSI: NSNumber) {
-        if !discoveredPeripherals.contains(where: { $0.identifier == peripheral.identifier }) {
-            discoveredPeripherals.append(peripheral)
+        
+        guard let category = inferCategory(from: advertisementData) else { return }
+        
+        if let index = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
+            devices[index] = DiscoveredDevice(
+                peripheral: peripheral,
+                category: category,
+                customName: devices[index].customName,
+                isConnected: devices[index].isConnected
+            )
+            return
         }
+        
+        let device = DiscoveredDevice(
+            peripheral: peripheral,
+            category: category,
+            customName: labelFor(peripheral),
+            isConnected: false
+        )
+        
+        devices.append(device)
     }
     
     func centralManager(_ central: CBCentralManager,
                         didConnect peripheral: CBPeripheral) {
         peripheral.delegate = self
+        
+        if let index = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
+            devices[index].isConnected = true
+        }
+        
         peripheral.discoverServices(nil)
+    }
+    
+    func centralManager(_ central: CBCentralManager,
+                        didDisconnectPeripheral peripheral: CBPeripheral,
+                        error: Error?) {
+        if let index = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
+            devices[index].isConnected = false
+        }
     }
 }
 
@@ -89,19 +217,41 @@ extension BluetoothManager: CBCentralManagerDelegate {
 extension BluetoothManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverServices error: Error?) {
-        guard error == nil else { return }
-        peripheral.services?.forEach { service in
-            peripheral.discoverCharacteristics(nil, for: service)
+        guard error == nil else {
+            print("Service discovery error: \(error!)")
+            return
+        }
+        
+        guard let services = peripheral.services else { return }
+        
+        for service in services {
+            switch service.uuid {
+            case heartRateServiceUUID:
+                peripheral.discoverCharacteristics([heartRateMeasurementUUID], for: service)
+            case cyclingPowerServiceUUID:
+                peripheral.discoverCharacteristics([cyclingPowerMeasurementUUID], for: service)
+            case cscServiceUUID:
+                peripheral.discoverCharacteristics([cscMeasurementUUID], for: service)
+            case ftmsServiceUUID:
+                // FTMS – we care about Indoor Bike Data
+                peripheral.discoverCharacteristics([indoorBikeDataUUID], for: service)
+            default:
+                break
+            }
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        guard error == nil else { return }
+        guard error == nil else {
+            print("Characteristic discovery error: \(error!)")
+            return
+        }
         
-        service.characteristics?.forEach { characteristic in
-            // Subscribe to notify where available
+        guard let characteristics = service.characteristics else { return }
+        
+        for characteristic in characteristics {
             if characteristic.properties.contains(.notify) {
                 peripheral.setNotifyValue(true, for: characteristic)
             }
@@ -111,37 +261,57 @@ extension BluetoothManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard error == nil, let value = characteristic.value else { return }
+        guard error == nil, let data = characteristic.value else { return }
         
-        let serviceUUID = characteristic.service?.uuid
-        
-        // Heart rate
-        if serviceUUID == heartRateServiceUUID {
-            handleHeartRate(value)
-        }
-        // Cadence (CSC)
-        else if serviceUUID == cscServiceUUID {
-            handleCadence(value)
-        }
-        // Power (Cycling Power service – may differ per trainer)
-        else if serviceUUID == cyclingPowerServiceUUID {
-            handlePower(value)
+        switch characteristic.uuid {
+        case heartRateMeasurementUUID:
+            handleHeartRate(data)
+        case cyclingPowerMeasurementUUID:
+            // CPS – use ONLY for power (cadence from CSC or FTMS instead)
+            handleCyclingPower(peripheral: peripheral, data: data)
+        case cscMeasurementUUID:
+            handleCSC(peripheral: peripheral, data: data)
+        case indoorBikeDataUUID:
+            // FTMS Indoor Bike Data
+            handleFTMSIndoorBikeData(peripheral: peripheral, data: data)
+        default:
+            break
         }
     }
 }
 
-// MARK: - Parsing helpers
+// MARK: - Parsing & category helpers
 
 extension BluetoothManager {
+    private func inferCategory(from advertisementData: [String: Any]) -> DeviceCategory? {
+        guard let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID],
+              !serviceUUIDs.isEmpty else {
+            return nil
+        }
+        
+        if serviceUUIDs.contains(ftmsServiceUUID) {
+            return .trainer
+        }
+        if serviceUUIDs.contains(cyclingPowerServiceUUID) {
+            return .powerMeter
+        }
+        if serviceUUIDs.contains(cscServiceUUID) {
+            return .cadence
+        }
+        if serviceUUIDs.contains(heartRateServiceUUID) {
+            return .heartRate
+        }
+        
+        return nil
+    }
+    
     private func handleHeartRate(_ data: Data) {
-        // Very simplified HR parsing per Bluetooth spec:
-        // [flags (1 byte)] [HR value (1 or 2 bytes)]
         guard data.count >= 2 else { return }
         let flags = data[0]
-        let hrIsUInt16 = (flags & 0x01) != 0
+        let isUInt16 = (flags & 0x01) != 0
         
         let hr: Int
-        if hrIsUInt16 {
+        if isUInt16 {
             guard data.count >= 3 else { return }
             hr = Int(UInt16(data[1]) | (UInt16(data[2]) << 8))
         } else {
@@ -153,41 +323,107 @@ extension BluetoothManager {
         }
     }
     
-    private func handleCadence(_ data: Data) {
-        // CSC Measurement format is more complex (includes wheel revs, crank revs, timestamps).
-        // For simplicity, imagine we’ve already extracted cadence (rpm) from the bytes:
-        let cadenceRPM = parseCadenceFromCSC(data: data)
-        
-        DispatchQueue.main.async {
-            self.metrics.cadence = cadenceRPM
-        }
-    }
-    
-    private func parseCadenceFromCSC(data: Data) -> Int {
-        // TODO: implement according to Bluetooth CSC spec
-        // Placeholder:
-        return 90
-    }
-    
-    private func handlePower(_ data: Data) {
-        // Cycling Power Measurement:
-        // Flags (2 bytes) + Instantaneous Power (2 bytes, signed)
-        guard data.count >= 4 else { return }
+    // CPS – **power only** (cadence from CSC/FTMS instead)
+    private func handleCyclingPower(peripheral: CBPeripheral, data: Data) {
         let bytes = [UInt8](data)
-        let power = Int16(bitPattern: UInt16(bytes[2]) | (UInt16(bytes[3]) << 8))
-        let watts = Int(power)
+        guard bytes.count >= 4 else { return }
+        
+        // Flags (2 bytes) – ignored for now
+        // let flags = UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
+        
+        // Instantaneous Power (signed 16-bit, W)
+        let powerValue = Int16(bitPattern: UInt16(bytes[2]) | (UInt16(bytes[3]) << 8))
+        let watts = Int(powerValue)
         
         DispatchQueue.main.async {
             self.metrics.powerInstant = watts
-            self.update3SecondPower(with: watts)
+            self.update3SecondPower(watts: watts)
         }
     }
     
-    private func update3SecondPower(with watts: Int) {
+    // FTMS Indoor Bike Data (0x2AD2)
+    // We parse instantaneous speed (unused for now), cadence and power.
+    private func handleFTMSIndoorBikeData(peripheral: CBPeripheral, data: Data) {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 4 else { return }
+        
+        // Flags: 16-bit little endian
+        let flags = UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
+        var index = 2
+        
+        var instantaneousSpeedKmh: Double?
+        var instantaneousCadenceRPM: Int?
+        var instantaneousPowerWatts: Int?
+        
+        // Instantaneous Speed (always included when this is the final record).
+        // uint16, resolution 0.01 km/h
+        guard bytes.count >= index + 2 else { return }
+        let rawSpeed = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+        instantaneousSpeedKmh = Double(rawSpeed) / 100.0
+        index += 2
+        
+        // Average Speed present? (bit 1)
+        if (flags & (1 << 1)) != 0 {
+            guard bytes.count >= index + 2 else { return }
+            index += 2
+        }
+        
+        // Instantaneous Cadence present? (bit 2) – uint16, 0.5 rev/min
+        if (flags & (1 << 2)) != 0 {
+            guard bytes.count >= index + 2 else { return }
+            let rawCadence = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+            instantaneousCadenceRPM = Int(round(Double(rawCadence) / 2.0))
+            index += 2
+        }
+        
+        // Average Cadence present? (bit 3) – skip if present
+        if (flags & (1 << 3)) != 0 {
+            guard bytes.count >= index + 2 else { return }
+            index += 2
+        }
+        
+        // Total Distance present? (bit 4) – uint24, skip 3 bytes
+        if (flags & (1 << 4)) != 0 {
+            guard bytes.count >= index + 3 else { return }
+            index += 3
+        }
+        
+        // Resistance Level present? (bit 5) – int16, skip or parse later if needed
+        if (flags & (1 << 5)) != 0 {
+            guard bytes.count >= index + 2 else { return }
+            // let resistance = Int16(bitPattern: UInt16(bytes[index]) | (UInt16(bytes[index+1]) << 8))
+            index += 2
+        }
+        
+        // Instantaneous Power present? (bit 6) – int16, W
+        if (flags & (1 << 6)) != 0 {
+            guard bytes.count >= index + 2 else { return }
+            let rawPower = Int16(bitPattern: UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8))
+            instantaneousPowerWatts = Int(rawPower)
+            index += 2
+        }
+        
+        // We ignore the rest (average power, energy, HR, etc.) for now.
+        
+        DispatchQueue.main.async {
+            if let watts = instantaneousPowerWatts {
+                self.metrics.powerInstant = watts
+                self.update3SecondPower(watts: watts)
+            }
+            
+            if let cadence = instantaneousCadenceRPM,
+               cadence >= 20, cadence <= 200 {
+                self.metrics.cadence = cadence
+            }
+            
+            // If you later add speed to WorkoutMetrics, you can store it here:
+            // self.metrics.speedKmh = instantaneousSpeedKmh
+        }
+    }
+    
+    private func update3SecondPower(watts: Int) {
         let now = Date().timeIntervalSince1970
         powerSamples.append((time: now, watts: watts))
-        
-        // Drop samples older than 3 seconds
         powerSamples = powerSamples.filter { now - $0.time <= 3.0 }
         
         let sum = powerSamples.reduce(0) { $0 + $1.watts }
@@ -196,5 +432,51 @@ extension BluetoothManager {
         } else {
             metrics.power3s = nil
         }
+    }
+    
+    // Cadence from CSC (Cycling Speed & Cadence) Measurement (0x2A5B)
+    private func handleCSC(peripheral: CBPeripheral, data: Data) {
+        let bytes = [UInt8](data)
+        guard !bytes.isEmpty else { return }
+        
+        let flags = bytes[0]
+        let wheelDataPresent = (flags & 0x01) != 0
+        let crankDataPresent = (flags & 0x02) != 0
+        
+        var index = 1
+        
+        // Skip wheel data (4 bytes revs + 2 bytes time) if present
+        if wheelDataPresent {
+            guard bytes.count >= index + 6 else { return }
+            index += 6
+        }
+        
+        // Need crank data for cadence
+        guard crankDataPresent else { return }
+        guard bytes.count >= index + 4 else { return }
+        
+        let revs = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+        let eventTime = UInt16(bytes[index + 2]) | (UInt16(bytes[index + 3]) << 8)
+        
+        let deviceID = peripheral.identifier
+        
+        if let last = lastCrankData[deviceID] {
+            let deltaRevs = UInt16(revs &- last.revs)
+            let deltaTimeTicks = UInt16(eventTime &- last.eventTime)
+            
+            if deltaTimeTicks > 0 {
+                let seconds = Double(deltaTimeTicks) / 1024.0
+                let cadenceRPM = Int(round((Double(deltaRevs) / seconds) * 60.0))
+                
+                if cadenceRPM >= 20 && cadenceRPM <= 200 {
+                    DispatchQueue.main.async {
+                        self.metrics.cadence = cadenceRPM
+                    }
+                }
+            }
+        }
+        
+        // store latest data
+        lastCrankData[deviceID] = (revs: revs, eventTime: eventTime)
     }
 }
