@@ -1,8 +1,8 @@
 //
 //  WorkoutMetrics.swift
-//  Lightbulb
+//  Freespeed
 //
-//  Created by Richard Melik on 16/12/2025.
+//  Created by Richard Melik on 18/12/2025.
 //
 
 import Foundation
@@ -13,9 +13,23 @@ class WorkoutMetrics: ObservableObject {
     
     @Published var powerInstant: Int? = nil
     @Published var power3s: Int? = nil
-    
     @Published var cadence: Int? = nil
     @Published var heartRate: Int? = nil
+    
+    private var timer: Timer?
+    private var startDate: Date?
+    
+    func startTimer() {
+        startDate = Date()
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, let start = self.startDate else { return }
+            self.elapsedTime = Date().timeIntervalSince(start)
+        }
+    }
+    
+    func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
 }
-
-
