@@ -1,0 +1,17 @@
+//
+//  FreespeedApp.swift
+//  Freespeed
+//
+//  Created by Richard Melik on 17/12/2025.
+//
+
+import SwiftUI
+
+@main
+struct FreespeedApp: App {
+    var body: some Scene {
+        WindowGroup {
+            PairingView()
+        }
+    }
+}
