@@ -1,16 +1,21 @@
 //
 //  PairingView.swift
-//  Lightbulb
+//  Freespeed
 //
-//  Created by Richard Melik on 16/12/2025.
+//  Created by Richard Melik on 18/12/2025.
 //
 
 import SwiftUI
 import CoreBluetooth
 
 struct PairingView: View {
-    @StateObject var metrics = WorkoutMetrics()
-    @StateObject var btManager: BluetoothManager
+    @StateObject private var metrics: WorkoutMetrics
+    @StateObject private var btManager: BluetoothManager
+    
+    @State private var editingDevice: DiscoveredDevice?
+    @State private var draftName: String = ""
+    
+    @State private var selectedDevice: DiscoveredDevice?   // for navigation
     
     init() {
         let metrics = WorkoutMetrics()
@@ -20,39 +25,188 @@ struct PairingView: View {
     
     var body: some View {
         NavigationStack {
-            List {
-                Section("Discovered Devices") {
-                    ForEach(btManager.discoveredPeripherals, id: \.identifier) { peripheral in
-                        Button {
-                            btManager.connect(peripheral)
-                        } label: {
-                            HStack {
-                                Text(peripheral.name ?? "Unknown")
-                                Spacer()
-                                Text(peripheral.identifier.uuidString.prefix(4) + "…")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+            VStack(spacing: 16) {
+                // Bluetooth status
+                VStack {
+                    Text("Bluetooth status")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    
+                    Text(btManager.state.rawValue)
+                        .font(.headline)
+                        .foregroundStyle(btManager.state == .poweredOn ? .green : .red)
+                }
+                .padding(.top)
+                
+                // Device list
+                List {
+                    Section("Sensors & Trainers") {
+                        if btManager.devices.isEmpty {
+                            Text(emptyStateText)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(btManager.devices) { device in
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(device.displayName)
+                                            .font(.headline)
+                                        Text(device.category.rawValue)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    
+                                    Spacer()
+                                    
+                                    if device.isConnected {
+                                        Text("Connected")
+                                            .font(.caption)
+                                            .padding(6)
+                                            .background(Color.green.opacity(0.2))
+                                            .foregroundColor(.green)
+                                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                    }
+                                    
+                                    Menu {
+                                        Button(device.isConnected ? "Reconnect" : "Connect") {
+                                            btManager.connect(device)
+                                        }
+                                        
+                                        Button("Disconnect", role: .destructive) {
+                                            btManager.disconnect(device)
+                                        }
+                                        .disabled(!device.isConnected)
+                                        
+                                        Button("Rename") {
+                                            editingDevice = device
+                                            draftName = device.customName ?? device.defaultName
+                                        }
+                                    } label: {
+                                        Image(systemName: "ellipsis.circle")
+                                            .imageScale(.large)
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                
+                // Go to workout button
+                Button {
+                    if let device = primaryWorkoutDevice {
+                        selectedDevice = device
+                    }
+                } label: {
+                    Text(primaryWorkoutDevice == nil
+                         ? "Go to Workout (connect a device)"
+                         : "Go to Workout")
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(primaryWorkoutDevice == nil ? Color.gray.opacity(0.3) : Color.accentColor)
+                        .foregroundColor(primaryWorkoutDevice == nil ? .secondary : .white)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .disabled(primaryWorkoutDevice == nil)
+                .padding([.horizontal, .bottom])
             }
             .navigationTitle("Pair Devices")
             .toolbar {
-                NavigationLink("Start Workout") {
-                    WorkoutView(metrics: metrics)
-                        .onAppear {
-                            btManager.startWorkoutTimer()
-                        }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Rescan") {
+                        btManager.stopScanning()
+                        btManager.startScanning()
+                    }
+                    .disabled(btManager.state != .poweredOn)
                 }
             }
-            .onAppear {
-                btManager.startScanning()
+            // Rename sheet
+            .sheet(item: $editingDevice) { device in
+                RenameDeviceSheet(
+                    device: device,
+                    draftName: $draftName
+                ) { newName in
+                    btManager.updateCustomName(
+                        for: device.id,
+                        to: newName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+                }
             }
+            // Navigate to WorkoutView when a device is chosen
+            .navigationDestination(item: $selectedDevice) { device in
+                WorkoutView(
+                    metrics: metrics,
+                    deviceName: device.displayName
+                )
+            }
+        }
+    }
+    
+    // Prefer a connected trainer; if none, power meter; else any connected device
+    private var primaryWorkoutDevice: DiscoveredDevice? {
+        if let trainer = btManager.devices.first(where: { $0.isConnected && $0.category == .trainer }) {
+            return trainer
+        }
+        if let pm = btManager.devices.first(where: { $0.isConnected && $0.category == .powerMeter }) {
+            return pm
+        }
+        return btManager.devices.first(where: { $0.isConnected })
+    }
+    
+    private var emptyStateText: String {
+        switch btManager.state {
+        case .poweredOn:
+            return "Searching for trainers and sensors…"
+        case .poweredOff:
+            return "Turn on Bluetooth to find trainers and sensors."
+        case .unauthorized:
+            return "Bluetooth access is not allowed. Enable it in Settings."
+        default:
+            return "Waiting for Bluetooth…"
         }
     }
 }
 
+struct RenameDeviceSheet: View {
+    let device: DiscoveredDevice
+    @Binding var draftName: String
+    var onSave: (String?) -> Void
+    
+    @Environment(\.dismiss) private var dismiss
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Custom Name") {
+                    TextField("Device name", text: $draftName)
+                }
+                
+                Section {
+                    Button("Save") {
+                        let trimmed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        onSave(trimmed.isEmpty ? nil : trimmed)
+                        dismiss()
+                    }
+                    .disabled(draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    
+                    if device.customName != nil {
+                        Button("Clear custom name", role: .destructive) {
+                            onSave(nil)
+                            draftName = ""
+                            dismiss()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Rename Device")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
 
 #Preview {
     PairingView()
