@@ -1,22 +1,27 @@
 //
 //  WorkoutView.swift
-//  Lightbulb
+//  Freespeed
 //
-//  Created by Richard Melik on 16/12/2025.
+//  Created by Richard Melik on 18/12/2025.
 //
 
 import SwiftUI
 
 struct WorkoutView: View {
     @ObservedObject var metrics: WorkoutMetrics
+    let deviceName: String
     
     var body: some View {
         VStack(spacing: 24) {
-            Text("Workout")
-                .font(.largeTitle)
-                .bold()
+            VStack(spacing: 4) {
+                Text("Workout")
+                    .font(.largeTitle)
+                    .bold()
+                Text(deviceName)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
             
-            // 3-second power
             VStack {
                 Text("3s Power")
                     .font(.headline)
@@ -42,6 +47,12 @@ struct WorkoutView: View {
             Spacer()
         }
         .padding()
+        .onAppear {
+            metrics.startTimer()
+        }
+        .onDisappear {
+            metrics.stopTimer()
+        }
     }
     
     private func formatTime(_ seconds: TimeInterval) -> String {
@@ -78,8 +89,6 @@ struct MetricTile: View {
     }
 }
 
-
-#Preview("Workout Screen") {
-    WorkoutView(metrics: WorkoutMetrics())
+#Preview {
+    WorkoutView(metrics: WorkoutMetrics(), deviceName: "Demo Trainer")
 }
-
