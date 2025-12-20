@@ -9,49 +9,121 @@ import SwiftUI
 
 struct WorkoutView: View {
     @ObservedObject var metrics: WorkoutMetrics
-    let deviceName: String
+    @EnvironmentObject var bluetoothManager: BluetoothManager
+    
+    @State private var ergText: String = ""
     
     var body: some View {
         VStack(spacing: 24) {
-            VStack(spacing: 4) {
-                Text("Workout")
-                    .font(.largeTitle)
-                    .bold()
-                Text(deviceName)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+            // Header
+            Text("Workout")
+                .font(.largeTitle)
+                .bold()
+            
+            // Two power sources (main focus)
+            HStack(spacing: 16) {
+                PowerTile(
+                    title: metrics.primaryPowerSourceName ?? "Power 1",
+                    value: metrics.primaryPowerInstant
+                )
+                
+                PowerTile(
+                    title: metrics.secondaryPowerSourceName ?? "Power 2",
+                    value: metrics.secondaryPowerInstant
+                )
             }
             
-            VStack {
-                Text("3s Power")
-                    .font(.headline)
-                Text(metrics.power3s.map { "\($0) W" } ?? "-- W")
-                    .font(.system(size: 48, weight: .bold, design: .rounded))
-            }
-            
-            HStack(spacing: 32) {
-                MetricTile(title: "Cadence",
-                           value: metrics.cadence.map { "\($0) rpm" } ?? "-- rpm")
-                MetricTile(title: "Heart Rate",
-                           value: metrics.heartRate.map { "\($0) bpm" } ?? "-- bpm")
-            }
-            
-            VStack {
-                Text("Elapsed Time")
-                    .font(.headline)
-                Text(formatTime(metrics.elapsedTime))
-                    .font(.title)
-                    .monospacedDigit()
+            // Secondary metrics: speed, cadence, HR, time (smaller)
+            VStack(spacing: 12) {
+                HStack(spacing: 16) {
+                    SmallMetricTile(
+                        title: "Speed",
+                        value: metrics.speedKmh.map { String(format: "%.1f km/h", $0) } ?? "-- km/h"
+                    )
+                    SmallMetricTile(
+                        title: "Cadence",
+                        value: metrics.cadence.map { "\($0) rpm" } ?? "-- rpm"
+                    )
+                    SmallMetricTile(
+                        title: "Heart Rate",
+                        value: metrics.heartRate.map { "\($0) bpm" } ?? "-- bpm"
+                    )
+                }
+                
+                SmallMetricTile(
+                    title: "Elapsed",
+                    value: formatTime(metrics.elapsedTime)
+                )
+                .frame(maxWidth: .infinity)
             }
             
             Spacer()
+            
+            // ERG control
+            VStack(alignment: .leading, spacing: 8) {
+                Text("ERG Target Power")
+                    .font(.headline)
+                
+                HStack {
+                    TextField("Watts", text: $ergText)
+                        .keyboardType(.numberPad)
+                        .textFieldStyle(.roundedBorder)
+                    
+                    Button("Set") {
+                        if let watts = Int(ergText) {
+                            bluetoothManager.setErgTargetPower(watts)
+                            dismissKeyboard()
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.accentColor)
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                
+                if let currentErg = metrics.ergTargetWatts {
+                    Text("Current ERG: \(currentErg) W")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            
+            // Timer controls
+            HStack(spacing: 16) {
+                Button("Start") {
+                    metrics.start()
+                }
+                .disabled(!(metrics.timerState == .idle || metrics.timerState == .stopped))
+                .controlButtonStyle(enabled: metrics.timerState == .idle || metrics.timerState == .stopped)
+                
+                Button(metrics.timerState == .running ? "Pause" : "Resume") {
+                    if metrics.timerState == .running {
+                        metrics.pause()
+                    } else if metrics.timerState == .paused || metrics.timerState == .stopped {
+                        metrics.resume()
+                    }
+                }
+                .disabled(!(metrics.timerState == .running ||
+                            metrics.timerState == .paused ||
+                            metrics.timerState == .stopped))
+                .controlButtonStyle(enabled: metrics.timerState == .running ||
+                                           metrics.timerState == .paused ||
+                                           metrics.timerState == .stopped)
+                
+                Button("Stop") {
+                    metrics.stop()
+                }
+                .disabled(!(metrics.timerState == .running || metrics.timerState == .paused))
+                .controlButtonStyle(enabled: metrics.timerState == .running ||
+                                           metrics.timerState == .paused,
+                                    isDestructive: true)
+            }
         }
         .padding()
-        .onAppear {
-            metrics.startTimer()
-        }
-        .onDisappear {
-            metrics.stopTimer()
+        .contentShape(Rectangle())   // ✅ makes empty areas tappable
+        .onTapGesture {
+            dismissKeyboard()
         }
     }
     
@@ -69,18 +141,21 @@ struct WorkoutView: View {
     }
 }
 
-struct MetricTile: View {
+// MARK: - Subviews
+
+struct PowerTile: View {
     let title: String
-    let value: String
+    let value: Int?
     
     var body: some View {
-        VStack {
+        VStack(spacing: 8) {
             Text(title)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            Text(value)
-                .font(.title2)
-                .bold()
+            Text(value.map { "\($0) W" } ?? "-- W")
+                .font(.system(size: 44, weight: .bold, design: .rounded))
+                .minimumScaleFactor(0.6)
+                .lineLimit(1)
         }
         .padding()
         .frame(maxWidth: .infinity)
@@ -89,6 +164,45 @@ struct MetricTile: View {
     }
 }
 
+struct SmallMetricTile: View {
+    let title: String
+    let value: String
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.headline)
+                .monospacedDigit()
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - Button style helper
+
+private extension View {
+    func controlButtonStyle(enabled: Bool, isDestructive: Bool = false) -> some View {
+        self
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(enabled
+                        ? (isDestructive ? Color.red.opacity(0.85) : Color.accentColor)
+                        : Color.gray.opacity(0.3))
+            .foregroundColor(.white)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
 #Preview {
-    WorkoutView(metrics: WorkoutMetrics(), deviceName: "Demo Trainer")
+    let metrics = WorkoutMetrics()
+    let manager = BluetoothManager(metrics: metrics)
+    
+    WorkoutView(metrics: metrics)
+        .environmentObject(manager)
 }
