@@ -68,7 +68,12 @@ struct PairingView: View {
                                     
                                     Menu {
                                         Button(device.isConnected ? "Reconnect" : "Connect") {
-                                            btManager.connect(device)
+                                            if device.isConnected {
+                                                btManager.disconnect(device)
+                                                btManager.connect(device)
+                                            } else {
+                                                btManager.connect(device)
+                                            }
                                         }
                                         
                                         Button("Disconnect", role: .destructive) {
@@ -118,6 +123,12 @@ struct PairingView: View {
                     .disabled(btManager.state != .poweredOn)
                 }
             }
+            .onAppear {
+                // optional: makes the screen feel “alive” if coming back to it
+                if btManager.state == .poweredOn {
+                    btManager.startScanning()
+                }
+            }
             // Rename sheet
             .sheet(item: $editingDevice) { device in
                 RenameDeviceSheet(
@@ -131,11 +142,9 @@ struct PairingView: View {
                 }
             }
             // Navigate to WorkoutView when a device is chosen
-            .navigationDestination(item: $selectedDevice) { device in
-                WorkoutView(
-                    metrics: metrics,
-                    deviceName: device.displayName
-                )
+            .navigationDestination(item: $selectedDevice) { _ in
+                WorkoutView(metrics: metrics)
+                    .environmentObject(btManager)
             }
         }
     }
