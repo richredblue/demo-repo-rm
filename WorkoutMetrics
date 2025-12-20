@@ -1,35 +1,208 @@
 //
-//  WorkoutMetrics.swift
+//  WorkoutView.swift
 //  Freespeed
 //
 //  Created by Richard Melik on 18/12/2025.
 //
 
-import Foundation
-import Combine
+import SwiftUI
 
-class WorkoutMetrics: ObservableObject {
-    @Published var elapsedTime: TimeInterval = 0
+struct WorkoutView: View {
+    @ObservedObject var metrics: WorkoutMetrics
+    @EnvironmentObject var bluetoothManager: BluetoothManager
     
-    @Published var powerInstant: Int? = nil
-    @Published var power3s: Int? = nil
-    @Published var cadence: Int? = nil
-    @Published var heartRate: Int? = nil
+    @State private var ergText: String = ""
     
-    private var timer: Timer?
-    private var startDate: Date?
-    
-    func startTimer() {
-        startDate = Date()
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, let start = self.startDate else { return }
-            self.elapsedTime = Date().timeIntervalSince(start)
+    var body: some View {
+        VStack(spacing: 24) {
+            // Header
+            Text("Workout")
+                .font(.largeTitle)
+                .bold()
+            
+            // Two power sources (main focus)
+            HStack(spacing: 16) {
+                PowerTile(
+                    title: metrics.primaryPowerSourceName ?? "Power 1",
+                    value: metrics.primaryPowerInstant
+                )
+                
+                PowerTile(
+                    title: metrics.secondaryPowerSourceName ?? "Power 2",
+                    value: metrics.secondaryPowerInstant
+                )
+            }
+            
+            // Secondary metrics: speed, cadence, HR, time (smaller)
+            VStack(spacing: 12) {
+                HStack(spacing: 16) {
+                    SmallMetricTile(
+                        title: "Speed",
+                        value: metrics.speedKmh.map { String(format: "%.1f km/h", $0) } ?? "-- km/h"
+                    )
+                    SmallMetricTile(
+                        title: "Cadence",
+                        value: metrics.cadence.map { "\($0) rpm" } ?? "-- rpm"
+                    )
+                    SmallMetricTile(
+                        title: "Heart Rate",
+                        value: metrics.heartRate.map { "\($0) bpm" } ?? "-- bpm"
+                    )
+                }
+                
+                SmallMetricTile(
+                    title: "Elapsed",
+                    value: formatTime(metrics.elapsedTime)
+                )
+                .frame(maxWidth: .infinity)
+            }
+            
+            Spacer()
+            
+            // ERG control
+            VStack(alignment: .leading, spacing: 8) {
+                Text("ERG Target Power")
+                    .font(.headline)
+                
+                HStack {
+                    TextField("Watts", text: $ergText)
+                        .keyboardType(.numberPad)
+                        .textFieldStyle(.roundedBorder)
+                    
+                    Button("Set") {
+                        if let watts = Int(ergText) {
+                            bluetoothManager.setErgTargetPower(watts)
+                            dismissKeyboard()
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.accentColor)
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                
+                if let currentErg = metrics.ergTargetWatts {
+                    Text("Current ERG: \(currentErg) W")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            
+            // Timer controls
+            HStack(spacing: 16) {
+                Button("Start") {
+                    metrics.start()
+                }
+                .disabled(!(metrics.timerState == .idle || metrics.timerState == .stopped))
+                .controlButtonStyle(enabled: metrics.timerState == .idle || metrics.timerState == .stopped)
+                
+                Button(metrics.timerState == .running ? "Pause" : "Resume") {
+                    if metrics.timerState == .running {
+                        metrics.pause()
+                    } else if metrics.timerState == .paused || metrics.timerState == .stopped {
+                        metrics.resume()
+                    }
+                }
+                .disabled(!(metrics.timerState == .running ||
+                            metrics.timerState == .paused ||
+                            metrics.timerState == .stopped))
+                .controlButtonStyle(enabled: metrics.timerState == .running ||
+                                           metrics.timerState == .paused ||
+                                           metrics.timerState == .stopped)
+                
+                Button("Stop") {
+                    metrics.stop()
+                }
+                .disabled(!(metrics.timerState == .running || metrics.timerState == .paused))
+                .controlButtonStyle(enabled: metrics.timerState == .running ||
+                                           metrics.timerState == .paused,
+                                    isDestructive: true)
+            }
+        }
+        .padding()
+        .contentShape(Rectangle())   // ✅ makes empty areas tappable
+        .onTapGesture {
+            dismissKeyboard()
         }
     }
     
-    func stopTimer() {
-        timer?.invalidate()
-        timer = nil
+    private func formatTime(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds)
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        
+        if h > 0 {
+            return String(format: "%02d:%02d:%02d", h, m, sec)
+        } else {
+            return String(format: "%02d:%02d", m, sec)
+        }
     }
+}
+
+// MARK: - Subviews
+
+struct PowerTile: View {
+    let title: String
+    let value: Int?
+    
+    var body: some View {
+        VStack(spacing: 8) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Text(value.map { "\($0) W" } ?? "-- W")
+                .font(.system(size: 44, weight: .bold, design: .rounded))
+                .minimumScaleFactor(0.6)
+                .lineLimit(1)
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
+        .background(.thinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+struct SmallMetricTile: View {
+    let title: String
+    let value: String
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.headline)
+                .monospacedDigit()
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - Button style helper
+
+private extension View {
+    func controlButtonStyle(enabled: Bool, isDestructive: Bool = false) -> some View {
+        self
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(enabled
+                        ? (isDestructive ? Color.red.opacity(0.85) : Color.accentColor)
+                        : Color.gray.opacity(0.3))
+            .foregroundColor(.white)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+#Preview {
+    let metrics = WorkoutMetrics()
+    let manager = BluetoothManager(metrics: metrics)
+    
+    WorkoutView(metrics: metrics)
+        .environmentObject(manager)
 }
