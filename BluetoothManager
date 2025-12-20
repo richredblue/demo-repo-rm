@@ -68,21 +68,38 @@ class BluetoothManager: NSObject, ObservableObject {
     private let cscMeasurementUUID = CBUUID(string: "2A5B")
     private let cyclingPowerMeasurementUUID = CBUUID(string: "2A63")
     private let indoorBikeDataUUID = CBUUID(string: "2AD2")  // FTMS Indoor Bike Data
+    private let ftmsControlPointUUID = CBUUID(string: "2AD9") // FTMS Fitness Machine Control Point
     
     private let labelsKey = "BLEDeviceLabels"
     private var savedLabels: [String: String] = [:]
     
-    // For 3-second power average
-    private var powerSamples: [(time: TimeInterval, watts: Int)] = []
-    
-    // For cadence from crank data (per device) – used by CSC and (optionally) CPS
+    // For cadence from crank data (per device)
     private var lastCrankData: [UUID: (revs: UInt16, eventTime: UInt16)] = [:]
+    
+    // For "no data" reset to 0
+    private var lastHeartRateUpdate: Date?
+    private var lastCadenceUpdate: Date?
+    private var lastSpeedUpdate: Date?
+    private var staleDataTimer: Timer?
+    
+    // Track which devices are used as power sources
+    private var primaryPowerDeviceID: UUID?
+    private var secondaryPowerDeviceID: UUID?
+    
+    // FTMS control point
+    private var ftmsControlPointCharacteristics: [UUID: CBCharacteristic] = [:]
+    private var ftmsRequestedControl: Set<UUID> = []
     
     init(metrics: WorkoutMetrics) {
         self.metrics = metrics
         super.init()
         loadLabels()
         central = CBCentralManager(delegate: self, queue: .main)
+        
+        // Timer to clear stale HR/cadence/speed
+        staleDataTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.checkForStaleMetrics()
+        }
     }
     
     // MARK: - Public API
@@ -129,6 +146,40 @@ class BluetoothManager: NSObject, ObservableObject {
         }
     }
     
+    /// Simple ERG control: set FTMS target power (watts) on the first connected trainer
+    func setErgTargetPower(_ watts: Int) {
+        // Find first connected FTMS trainer
+        guard let trainerDevice = devices.first(where: { $0.category == .trainer && $0.isConnected }) else {
+            print("No connected FTMS trainer for ERG")
+            return
+        }
+        guard let peripheral = trainerDevice.peripheral as CBPeripheral? else { return }
+        
+        guard let controlPoint = ftmsControlPointCharacteristics[peripheral.identifier] else {
+            print("No FTMS control point characteristic discovered for trainer")
+            return
+        }
+        
+        ensureFTMSControl(for: peripheral, controlPoint: controlPoint)
+        
+        // FTMS Set Target Power opcode = 0x05, parameter = int16 watts (little endian)
+        let clampedWatts = max(-32768, min(32767, watts))
+        let w = UInt16(bitPattern: Int16(clampedWatts))
+        
+        let value: [UInt8] = [
+            0x05,
+            UInt8(w & 0xFF),
+            UInt8((w >> 8) & 0xFF)
+        ]
+        
+        let data = Data(value)
+        peripheral.writeValue(data, for: controlPoint, type: .withResponse)
+        
+        DispatchQueue.main.async {
+            self.metrics.ergTargetWatts = watts
+        }
+    }
+    
     // MARK: - Persistence
     
     private func loadLabels() {
@@ -139,6 +190,71 @@ class BluetoothManager: NSObject, ObservableObject {
     
     private func labelFor(_ peripheral: CBPeripheral) -> String? {
         savedLabels[peripheral.identifier.uuidString]
+    }
+    
+    // MARK: - Stale data handling
+    
+    private func checkForStaleMetrics() {
+        let now = Date()
+        let timeout: TimeInterval = 5.0
+        
+        if let last = lastHeartRateUpdate, now.timeIntervalSince(last) > timeout {
+            metrics.heartRate = 0
+            lastHeartRateUpdate = nil
+        }
+        
+        if let last = lastCadenceUpdate, now.timeIntervalSince(last) > timeout {
+            metrics.cadence = 0
+            lastCadenceUpdate = nil
+        }
+        
+        if let last = lastSpeedUpdate, now.timeIntervalSince(last) > timeout {
+            metrics.speedKmh = 0
+            lastSpeedUpdate = nil
+        }
+    }
+    
+    // MARK: - Helper: power source management
+    
+    private func displayName(for peripheral: CBPeripheral) -> String {
+        if let device = devices.first(where: { $0.id == peripheral.identifier }) {
+            return device.displayName
+        }
+        return peripheral.name ?? "Unknown device"
+    }
+    
+    private func updatePower(for peripheral: CBPeripheral, watts: Int) {
+        let id = peripheral.identifier
+        
+        if primaryPowerDeviceID == nil {
+            primaryPowerDeviceID = id
+        }
+        
+        if primaryPowerDeviceID == id {
+            metrics.primaryPowerInstant = watts
+            metrics.primaryPowerSourceName = displayName(for: peripheral)
+        } else if secondaryPowerDeviceID == nil {
+            secondaryPowerDeviceID = id
+            metrics.secondaryPowerInstant = watts
+            metrics.secondaryPowerSourceName = displayName(for: peripheral)
+        } else if secondaryPowerDeviceID == id {
+            metrics.secondaryPowerInstant = watts
+            metrics.secondaryPowerSourceName = displayName(for: peripheral)
+        } else {
+            // More than two power-capable devices: ignore extra ones for now
+        }
+    }
+    
+    // MARK: - FTMS control helpers
+    
+    private func ensureFTMSControl(for peripheral: CBPeripheral, controlPoint: CBCharacteristic) {
+        let id = peripheral.identifier
+        guard !ftmsRequestedControl.contains(id) else { return }
+        ftmsRequestedControl.insert(id)
+        
+        // Request Control opcode = 0x00
+        let data = Data([0x00])
+        peripheral.writeValue(data, for: controlPoint, type: .withResponse)
     }
 }
 
@@ -233,8 +349,8 @@ extension BluetoothManager: CBPeripheralDelegate {
             case cscServiceUUID:
                 peripheral.discoverCharacteristics([cscMeasurementUUID], for: service)
             case ftmsServiceUUID:
-                // FTMS – we care about Indoor Bike Data
-                peripheral.discoverCharacteristics([indoorBikeDataUUID], for: service)
+                // FTMS – Indoor Bike Data + Control Point
+                peripheral.discoverCharacteristics([indoorBikeDataUUID, ftmsControlPointUUID], for: service)
             default:
                 break
             }
@@ -252,8 +368,15 @@ extension BluetoothManager: CBPeripheralDelegate {
         guard let characteristics = service.characteristics else { return }
         
         for characteristic in characteristics {
-            if characteristic.properties.contains(.notify) {
+            // Enable notifications/indications where appropriate
+            if characteristic.properties.contains(.notify) ||
+                characteristic.properties.contains(.indicate) {
                 peripheral.setNotifyValue(true, for: characteristic)
+            }
+            
+            // Cache FTMS control point
+            if characteristic.uuid == ftmsControlPointUUID {
+                ftmsControlPointCharacteristics[peripheral.identifier] = characteristic
             }
         }
     }
@@ -267,13 +390,14 @@ extension BluetoothManager: CBPeripheralDelegate {
         case heartRateMeasurementUUID:
             handleHeartRate(data)
         case cyclingPowerMeasurementUUID:
-            // CPS – use ONLY for power (cadence from CSC or FTMS instead)
             handleCyclingPower(peripheral: peripheral, data: data)
         case cscMeasurementUUID:
             handleCSC(peripheral: peripheral, data: data)
         case indoorBikeDataUUID:
-            // FTMS Indoor Bike Data
             handleFTMSIndoorBikeData(peripheral: peripheral, data: data)
+        case ftmsControlPointUUID:
+            // Control point response (we’ll just log for now)
+            print("FTMS Control Point response: \(data as NSData)")
         default:
             break
         }
@@ -320,29 +444,25 @@ extension BluetoothManager {
         
         DispatchQueue.main.async {
             self.metrics.heartRate = hr
+            self.lastHeartRateUpdate = Date()
         }
     }
     
-    // CPS – **power only** (cadence from CSC/FTMS instead)
+    // CPS – power only (cadence from CSC/FTMS instead)
     private func handleCyclingPower(peripheral: CBPeripheral, data: Data) {
         let bytes = [UInt8](data)
         guard bytes.count >= 4 else { return }
-        
-        // Flags (2 bytes) – ignored for now
-        // let flags = UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
         
         // Instantaneous Power (signed 16-bit, W)
         let powerValue = Int16(bitPattern: UInt16(bytes[2]) | (UInt16(bytes[3]) << 8))
         let watts = Int(powerValue)
         
         DispatchQueue.main.async {
-            self.metrics.powerInstant = watts
-            self.update3SecondPower(watts: watts)
+            self.updatePower(for: peripheral, watts: watts)
         }
     }
     
     // FTMS Indoor Bike Data (0x2AD2)
-    // We parse instantaneous speed (unused for now), cadence and power.
     private func handleFTMSIndoorBikeData(peripheral: CBPeripheral, data: Data) {
         let bytes = [UInt8](data)
         guard bytes.count >= 4 else { return }
@@ -355,8 +475,7 @@ extension BluetoothManager {
         var instantaneousCadenceRPM: Int?
         var instantaneousPowerWatts: Int?
         
-        // Instantaneous Speed (always included when this is the final record).
-        // uint16, resolution 0.01 km/h
+        // Instantaneous Speed (uint16, 0.01 km/h)
         guard bytes.count >= index + 2 else { return }
         let rawSpeed = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
         instantaneousSpeedKmh = Double(rawSpeed) / 100.0
@@ -376,22 +495,21 @@ extension BluetoothManager {
             index += 2
         }
         
-        // Average Cadence present? (bit 3) – skip if present
+        // Average Cadence present? (bit 3)
         if (flags & (1 << 3)) != 0 {
             guard bytes.count >= index + 2 else { return }
             index += 2
         }
         
-        // Total Distance present? (bit 4) – uint24, skip 3 bytes
+        // Total Distance present? (bit 4) – uint24
         if (flags & (1 << 4)) != 0 {
             guard bytes.count >= index + 3 else { return }
             index += 3
         }
         
-        // Resistance Level present? (bit 5) – int16, skip or parse later if needed
+        // Resistance Level present? (bit 5) – int16
         if (flags & (1 << 5)) != 0 {
             guard bytes.count >= index + 2 else { return }
-            // let resistance = Int16(bitPattern: UInt16(bytes[index]) | (UInt16(bytes[index+1]) << 8))
             index += 2
         }
         
@@ -403,34 +521,21 @@ extension BluetoothManager {
             index += 2
         }
         
-        // We ignore the rest (average power, energy, HR, etc.) for now.
-        
         DispatchQueue.main.async {
             if let watts = instantaneousPowerWatts {
-                self.metrics.powerInstant = watts
-                self.update3SecondPower(watts: watts)
+                self.updatePower(for: peripheral, watts: watts)
+            }
+            
+            if let speed = instantaneousSpeedKmh {
+                self.metrics.speedKmh = speed
+                self.lastSpeedUpdate = Date()
             }
             
             if let cadence = instantaneousCadenceRPM,
                cadence >= 20, cadence <= 200 {
                 self.metrics.cadence = cadence
+                self.lastCadenceUpdate = Date()
             }
-            
-            // If you later add speed to WorkoutMetrics, you can store it here:
-            // self.metrics.speedKmh = instantaneousSpeedKmh
-        }
-    }
-    
-    private func update3SecondPower(watts: Int) {
-        let now = Date().timeIntervalSince1970
-        powerSamples.append((time: now, watts: watts))
-        powerSamples = powerSamples.filter { now - $0.time <= 3.0 }
-        
-        let sum = powerSamples.reduce(0) { $0 + $1.watts }
-        if !powerSamples.isEmpty {
-            metrics.power3s = sum / powerSamples.count
-        } else {
-            metrics.power3s = nil
         }
     }
     
@@ -471,6 +576,7 @@ extension BluetoothManager {
                 if cadenceRPM >= 20 && cadenceRPM <= 200 {
                     DispatchQueue.main.async {
                         self.metrics.cadence = cadenceRPM
+                        self.lastCadenceUpdate = Date()
                     }
                 }
             }
